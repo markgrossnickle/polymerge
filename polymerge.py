@@ -3328,6 +3328,9 @@ def sky_rebuild_for(run, n):
     return rebuild
 
 
+BASE_LENDER = "--base"   # never a shot name: those are basenames
+
+
 def anchor_all(run):
     """Anchor every shot, in two passes: independently first, then a SIFT
     zoom hint for whatever could not manage it alone.
@@ -3361,20 +3364,37 @@ def anchor_all(run):
         except SystemExit as e:
             print(f"  no self-anchor: {e}")
             failed.append(n)
-    if failed and M_of:
+    # Lenders are every self-anchored shot, plus a --base: it sits in the
+    # template frame at a known offset, so it lends like an anchored shot.
+    # A local view only -- M_of stays the shots that anchored, or the
+    # "nothing anchored" refusal would never fire.
+    base = getattr(run, "base_bgr", None)
+    if failed and (M_of or base is not None):
+        lend_M, lend_scale = dict(M_of), dict(scale_of)
+        terr_of = {n: shots[n].terrain_mask() for n in list(M_of) + failed}
         # Keep the re-anchor outside this: nested PHASES double-count.
         with PHASES("anchor: SIFT zoom fallback"):
             feats = {n: sift_features(shots[n].img, shots[n].sift_mask(), args.nfeatures,
                                       args.contrast)
                      for n in list(M_of) + failed}
+            if base is not None:
+                bx0, by0 = board.base_rect[:2]
+                lend_M[BASE_LENDER] = np.float64([[1, 0, bx0], [0, 1, by0]])
+                lend_scale[BASE_LENDER] = 1.0
+                bmask = build_valid_mask(base, [], args.dark_thresh, 0, 0.0, 0.0)
+                bmask &= board_region(bmask, (BOARD_DIR_A, BOARD_DIR_B))
+                feats[BASE_LENDER] = sift_features(base, bmask, args.nfeatures,
+                                                   args.contrast)
+                terr_of[BASE_LENDER] = (cv2.cvtColor(base, cv2.COLOR_BGR2HSV)
+                                        [:, :, 1] >= PIXEL_FOG_SAT)
             hints = {}
             for n in failed:
                 # Ranked and gated on terrain inliers only.
                 best = (0, 0, None, None)
-                for m in M_of:
+                for m in lend_M:
                     M_nm, inl, terr = pair_transform(
                         *feats[n], *feats[m], args.ratio, args.reproj,
-                        terrain=(shots[n].terrain_mask(), shots[m].terrain_mask()))
+                        terrain=(terr_of[n], terr_of[m]))
                     if M_nm is not None and terr > best[0]:
                         best = (terr, inl, m, M_nm)
                 hints[n] = best
@@ -3391,7 +3411,7 @@ def anchor_all(run):
                   f"terrain (relative scale {k:.4f})")
             # A complete n -> template transform: its scale is the zoom hint
             # and its translation the pan hint, so both are at one zoom.
-            borrowed = (to_h(M_of[m]) @ to_h(M_nm))[:2]
+            borrowed = (to_h(lend_M[m]) @ to_h(M_nm))[:2]
             try:
                 s = shots[n]
                 M, src_of[n], implied, prior_of[n] = anchor_to_template(
@@ -3402,7 +3422,7 @@ def anchor_all(run):
                     min_scale_support=args.min_scale_support,
                     # M_nm maps n's pixels to m's, so 1 n-px = k m-px,
                     # and m's own anchor converts those to template px
-                    zoom_hint=scale_of[m] * k,
+                    zoom_hint=lend_scale[m] * k,
                     sky_rebuild=sky_rebuild_for(run, n),
                     pan_hint=borrowed, cache=shot_cache,
                     top_crop=args.top_crop, bottom_crop=args.bottom_crop)
