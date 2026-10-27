@@ -21,7 +21,16 @@ chrome --top-crop/--bottom-crop don't cover:
 
 Requires: opencv-python >= 4.4, numpy
 """
-import argparse, collections, contextlib, glob, itertools, json, os, time
+import argparse, collections, contextlib, glob, itertools, json, os, sys, time
+
+# The largest image decoded, in pixels. A file-size cap does not bound this: a
+# 1.2 MB PNG can declare 20000x20000, and decoding it plus a Shot's masks was
+# measured OOM-killing a merge under the container's 2 GB in 6 seconds. Phone
+# and tablet screenshots run 2-10 MP, so 40 MP is a bound on the absurd only.
+# OpenCV reads the variable once, at import, so it is set before the import;
+# an over-limit image then raises cv2.error at imread instead of decoding.
+MAX_IMAGE_PIXELS = 40_000_000
+os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = str(MAX_IMAGE_PIXELS)
 import cv2
 import numpy as np
 
@@ -3749,6 +3758,21 @@ def resolve_overlays(args):
     return overlays
 
 
+def read_input(path, name):
+    """cv2.imread, refusing an image over MAX_IMAGE_PIXELS by name.
+
+    Over the limit, imread raises rather than returning None, and the raw
+    cv2.error would otherwise reach the player as a traceback."""
+    try:
+        return cv2.imread(path)
+    except cv2.error as e:
+        if "validateInputImageSize" not in str(e):
+            raise
+        raise SystemExit(f"{name} is too large to merge -- over "
+                         f"{MAX_IMAGE_PIXELS // 1_000_000} megapixels. Post an "
+                         f"ordinary screenshot instead.")
+
+
 def load_inputs(run):
     """Read every screenshot into a Shot, and the --base image."""
     args = run.args
@@ -3761,9 +3785,9 @@ def load_inputs(run):
         shots = {}
         badge_found = set()
         for path, name in zip(args.images, names):
-            im = cv2.imread(path)
+            # basename only: this reaches a Discord channel
+            im = read_input(path, name)
             if im is None:
-                # basename only: this reaches a Discord channel
                 raise SystemExit(f"cannot read {name} -- it appears invalid")
             shots[name] = Shot(im, args, ui.get(name, []))
             if not args.no_badge_filter:
@@ -3776,7 +3800,7 @@ def load_inputs(run):
 
         # The prior composite is never a shot: it only seeds the paste canvas
         # (paste_composite), its geometry being exactly known.
-        base_bgr = cv2.imread(args.base) if args.base else None
+        base_bgr = read_input(args.base, "the base image") if args.base else None
         if args.base and base_bgr is None:
             raise SystemExit("cannot read --base image -- it appears invalid")
     run.ui = ui
@@ -4865,9 +4889,20 @@ def main():
     write_debug(run)
 
 
+# Printed on stderr just before a refusal's own message, which Python prints on
+# exit. Library noise -- libjpeg's "Premature end of JPEG file", libpng
+# warnings -- lands on the same stream earlier, so without a marker a caller
+# reading stderr cannot tell where the refusal starts. polybot keys on it.
+REFUSAL_MARKER = "POLYMERGE-REFUSAL:"
+
+
 if __name__ == "__main__":
     _t0 = time.perf_counter()
     try:
         main()
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            print(REFUSAL_MARKER, file=sys.stderr, flush=True)
+        raise
     finally:
         PHASES.report(time.perf_counter() - _t0)

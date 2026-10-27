@@ -37,4 +37,10 @@ COPY Assets/ ./Assets/
 RUN useradd --create-home --uid 10001 polybot
 USER polybot
 
+# The bot runs as PID 1, and Linux ignores SIGTERM -- Docker's default stop
+# signal -- for a PID 1 with no handler for it, which Python does not install.
+# So every stop or restart waited out Docker's 10 s and then SIGKILLed the bot.
+# Python does handle SIGINT (as KeyboardInterrupt), and discord.py's bot.run
+# shuts down cleanly on it.
+STOPSIGNAL SIGINT
 CMD ["python", "polybot.py"]

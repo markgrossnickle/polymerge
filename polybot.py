@@ -174,6 +174,14 @@ MAX_ATTACHMENTS = 3 * MAX_SHOTS
 # the bot is willing to download, not a limit it has to predict -- the
 # attachment is already on Discord's side by the time this is checked.
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+# The largest image the bot will download, in pixels. The byte cap above does
+# not bound this: a 1.2 MB PNG can declare 20000x20000, and decoding that was
+# measured OOM-killing a merge in 6 seconds. Discord reports an image's
+# dimensions on the attachment, so this refuses before queueing or downloading
+# anything. polymerge enforces the same number at decode (MAX_IMAGE_PIXELS
+# there), which also covers an attachment Discord gave no dimensions for --
+# keep the two in step.
+MAX_IMAGE_PIXELS = 40_000_000
 # Discord's default per-file upload limit is 10 MiB. **It has gone down as well
 # as up** -- 25 MiB until 16 January 2025 -- so never raise this on the
 # assumption that limits only grow. That assumption once set it to 20 MB, nearly
@@ -350,6 +358,48 @@ def safe_name(index, filename):
     ext = pathlib.Path(filename).suffix.lower()
     stem = re.sub(r"[^A-Za-z0-9_-]", "_", stem)[:40] or "shot"
     return f"{index:02d}_{stem}{ext}"
+
+
+# polymerge prints this on stderr immediately before a refusal's own message.
+# Everything after the last one is text written for the player; everything
+# before it, and all of stderr when it is absent, is for the console only.
+REFUSAL_MARKER = "POLYMERGE-REFUSAL:"
+
+
+def merge_failure(rc, stderr):
+    """What the channel is told about a merge that produced no composite.
+
+    Only a refusal polymerge raised on purpose is passed through -- those are
+    written for a human, and say what to do. Anything else is a fixed sentence:
+    a traceback, a merge killed for running out of memory (rc -9, empty
+    stderr), or a timeout. The old rule took stderr's first line or, failing
+    that, stdout's tail, which put OpenCV tracebacks and the per-shot
+    diagnostic log in front of players, and let a libjpeg warning printed
+    before a refusal stand in for the refusal itself."""
+    _, marker, refusal = (stderr or "").rpartition(REFUSAL_MARKER)
+    if marker and refusal.strip():
+        return refusal.strip()
+    if rc is None:
+        return (f"The merge took longer than {MERGE_TIMEOUT_S // 60} minutes "
+                f"and was stopped. Try fewer screenshots.")
+    if rc < 0:
+        return ("The merge was stopped before it finished, most likely for "
+                "running out of memory. Try fewer or smaller screenshots.")
+    return ("Something went wrong during the merge. Ask whoever runs the bot "
+            "to check its console.")
+
+
+def quote_words(words, limit=5):
+    """Words a player typed, echoed back as inline code.
+
+    A backtick inside a word would close the code span early and let whatever
+    follows render as markdown -- `x`@everyone becomes a live mention -- so
+    backticks are dropped. Bounded too, or a thousand junk words push the reply
+    past Discord's 2000 characters and the reply itself fails."""
+    shown = [f"`{w.replace('`', '')[:30] or '?'}`" for w in words[:limit]]
+    if len(words) > limit:
+        shown.append(f"{len(words) - limit} more")
+    return ", ".join(shown)
 
 
 def tail(text, limit=MAX_MSG_CHARS):
@@ -802,6 +852,12 @@ async def run_polymerge(workdir, image_paths, map_size, out_path, overlays=None,
         proc.kill()
         await proc.wait()
         return None, "", f"merge timed out after {MERGE_TIMEOUT_S}s"
+    except asyncio.CancelledError:
+        # Shutdown cancels the merge mid-run. Without this the child outlives
+        # the bot while do_merge's finally deletes its working directory.
+        proc.kill()
+        await proc.wait()
+        raise
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
@@ -825,7 +881,13 @@ intents.message_content = True
 # prefix (and different MARK/DONE emoji); its /merge does not collide, since
 # Discord disambiguates slash commands by application in the picker.
 COMMAND_PREFIX = os.environ.get("POLYMERGE_PREFIX") or "!"
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+# The bot never means to ping anyone but the player it is replying to. Without
+# this, any mention that reaches a message -- an echoed word, say -- pings for
+# real if the bot's role is allowed to mention @everyone or roles.
+bot = commands.Bot(
+    command_prefix=COMMAND_PREFIX, intents=intents,
+    allowed_mentions=discord.AllowedMentions(
+        everyone=False, roles=False, users=False, replied_user=True))
 
 # The help command's name, kept in one place because it is interpolated into
 # channel copy and into /merge's own description.
@@ -1099,9 +1161,16 @@ class Caller:
 
         if not self._channel_blocked:
             try:
-                send = (self._ctx.reply if reply and self._ctx is not None
-                        else self.channel.send)
                 rkw = route_kw()
+                if reply and self._ctx is not None:
+                    # A plain ctx.reply fails outright with a 400 once the
+                    # command message is gone -- deleted by the player, or by
+                    # a moderation bot that clears prefix commands -- and
+                    # on_command_error's own reply then fails the same way.
+                    # This posts without the reply link instead.
+                    rkw = dict(rkw, reference=self._ctx.message.to_reference(
+                        fail_if_not_exists=False))
+                send = self.channel.send
                 msg = (await send(content, **rkw) if content is not None
                        else await send(**rkw))
                 # Anything visible has now been said, so the "thinking"
@@ -1342,10 +1411,15 @@ async def on_tree_error(interaction, error):
     text = (f"Command failed: `{type(error).__name__}`. {SAD_EMOJI} "
             f"See bot console.")
     try:
-        if interaction.response.is_done():
-            await interaction.edit_original_response(content=text)
-        else:
+        if not interaction.response.is_done():
             await interaction.response.send_message(text, ephemeral=True)
+            return
+        try:
+            await interaction.edit_original_response(content=text)
+        except discord.NotFound:
+            # The deferral's placeholder is deleted once the public ack is up,
+            # so a failure after that has nothing to edit.
+            await interaction.followup.send(text, ephemeral=True)
     except discord.HTTPException:
         pass
 
@@ -1494,7 +1568,7 @@ async def merge(ctx, size: str = None, *extras):
     overlays, bad_layers = parse_overlays(words)
     if bad_layers:
         await caller.send(
-            f"Don't know what to do with {', '.join(f'`{w}`' for w in bad_layers)}. "
+            f"Don't know what to do with {quote_words(bad_layers)}. "
             f"{SAD_EMOJI} You can add "
             + ", ".join(f"`{n}`" for n in OVERLAY_NAMES)
             + f", in any order. `{COMMAND_PREFIX}merge help` says what each "
@@ -1607,7 +1681,7 @@ async def merge_slash(interaction: discord.Interaction,
         # Validated before defer -- there is nothing slow about parsing this
         # string, so there is no need to spend the interaction token on it.
         await interaction.response.send_message(
-            f"Don't know what to do with {', '.join(f'`{w}`' for w in bad_layers)}. "
+            f"Don't know what to do with {quote_words(bad_layers)}. "
             f"{SAD_EMOJI} You can add "
             + ", ".join(f"`{n}`" for n in OVERLAY_NAMES)
             + f", in any order. `/{HELP_COMMAND}` explains what each one draws.",
@@ -1788,6 +1862,26 @@ async def do_merge(caller, map_size, overlays, base=None, allow_history=True):
             f"{MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB Discord attachment "
             f"limit. {SAD_EMOJI} Post a smaller copy and try again.")
         return
+    # Dimensions, separately from bytes -- see MAX_IMAGE_PIXELS. Discord leaves
+    # width/height unset when it could not read the image; polymerge's own cap
+    # covers those at decode.
+    def pixels(a):
+        return (a.width or 0) * (a.height or 0)
+    huge = [str(i) for i, a in enumerate(shots, 1)
+            if pixels(a) > MAX_IMAGE_PIXELS]
+    which = None
+    if huge:
+        which = ("Image " + huge[0] if len(huge) == 1
+                 else "Images " + ", ".join(huge[:-1]) + " and " + huge[-1])
+        which += f" of {len(shots)} " + ("is" if len(huge) == 1 else "are")
+    elif base is not None and pixels(base) > MAX_IMAGE_PIXELS:
+        which = "The base image is"
+    if which is not None:
+        await caller.send(
+            f"{which} over {MAX_IMAGE_PIXELS // 1_000_000} megapixels, far "
+            f"bigger than any screenshot. {SAD_EMOJI} Post an ordinary "
+            f"screenshot instead.")
+        return
 
     # Refuse a wait nobody would sit through, rather than accepting it and
     # going quiet. The queue is unbounded and merges are serialized across
@@ -1838,6 +1932,8 @@ async def do_merge(caller, map_size, overlays, base=None, allow_history=True):
     # something abusive. Positions also read better when the shots came from
     # reactions scattered up a thread and nobody remembers the filenames.
     position_of = {}
+    # Which download failed, as channel copy, when one did.
+    fetch_failed = None
     try:
         # Acquired explicitly rather than with `async with`, so this merge can
         # leave the queue the moment it stops waiting -- whether that is because
@@ -1875,27 +1971,39 @@ async def do_merge(caller, map_size, overlays, base=None, allow_history=True):
                     pass
             async with caller.typing():
                 paths = []
-                for i, a in enumerate(shots):
-                    p = workdir / safe_name(i, a.filename)
-                    await a.save(p)
-                    paths.append(p)
-                    position_of[p.name] = i + 1
-
                 base_path = None
-                if base is not None:
-                    # A fixed name, not safe_name-indexed -- it is never one
-                    # of the counted "shots", so it needs no position_of
-                    # entry. The suffix is kept because cv2.imread goes by it.
-                    base_path = workdir / (
-                        "base" + pathlib.Path(base.filename).suffix.lower())
-                    await base.save(base_path)
+                # A download fails when its message was deleted while the
+                # merge sat in the queue. Uncaught, the ack went on claiming
+                # "Merging..." forever and the player heard nothing.
+                try:
+                    for i, a in enumerate(shots):
+                        fetch_failed = f"image {i + 1} of {len(shots)}"
+                        p = workdir / safe_name(i, a.filename)
+                        await a.save(p)
+                        paths.append(p)
+                        position_of[p.name] = i + 1
 
-                out_path = workdir / "merged.png"
-                t0 = time.monotonic()
-                rc, stdout, stderr = await run_polymerge(
-                    workdir, paths, map_size, out_path, overlays,
-                    base=base_path)
-                elapsed = time.monotonic() - t0
+                    if base is not None:
+                        fetch_failed = "the base image"
+                        # A fixed name, not safe_name-indexed -- it is never
+                        # one of the counted "shots", so it needs no
+                        # position_of entry. The suffix is kept because
+                        # cv2.imread goes by it.
+                        base_path = workdir / (
+                            "base" + pathlib.Path(base.filename).suffix.lower())
+                        await base.save(base_path)
+                    fetch_failed = None
+                except discord.HTTPException as e:
+                    print(f"#{caller.channel} merge FAILED: couldn't download "
+                          f"{fetch_failed}: {e}", file=sys.stderr)
+
+                if fetch_failed is None:
+                    out_path = workdir / "merged.png"
+                    t0 = time.monotonic()
+                    rc, stdout, stderr = await run_polymerge(
+                        workdir, paths, map_size, out_path, overlays,
+                        base=base_path)
+                    elapsed = time.monotonic() - t0
         finally:
             # Slot-hold time, not `elapsed`: the estimate is answering "when
             # does the slot free up", and the downloads above hold it too.
@@ -1908,7 +2016,7 @@ async def do_merge(caller, map_size, overlays, base=None, allow_history=True):
             # a merge that hung until MERGE_TIMEOUT_S says nothing about how long
             # merges take, and at 300s it would land near 30x the prediction.
             held = time.monotonic() - held0
-            if held > 1.0:
+            if held > 1.0 and fetch_failed is None:
                 predicted = MERGE_FIXED_S + MERGE_PER_SHOT_S * len(shots)
                 _speed.append(min(4.0, max(0.25, held / predicted)))
             _running_since = _running_shots = None
@@ -1920,12 +2028,21 @@ async def do_merge(caller, map_size, overlays, base=None, allow_history=True):
             # numbers move, so there is nothing a poll would catch in between.
             asyncio.create_task(refresh_queue_notices())
 
+        if fetch_failed is not None:
+            await caller.send(
+                reply=False,
+                content=f"Couldn't download {fetch_failed} -- was it deleted "
+                        f"while the merge waited? {SAD_EMOJI} Post it again "
+                        f"and merge.")
+            return
+
         if rc != 0 or not out_path.exists():
             # polymerge reports every refusal by raising SystemExit with an
             # explanation (wrong map size, nothing anchorable, unreadable
             # file). Those messages are written for a human, so pass them
-            # through rather than replacing them with a generic failure.
-            detail = tail(stderr) or tail(stdout) or "no output"
+            # through rather than replacing them with a generic failure --
+            # but only those; see merge_failure.
+            detail = tail(merge_failure(rc, stderr))
             # base_path is also a server-side temp path, same reasoning as the
             # per-shot names below -- scrub it before either substitution loop
             # runs, since it never appears in position_of.
@@ -1946,6 +2063,12 @@ async def do_merge(caller, map_size, overlays, base=None, allow_history=True):
             # like the bot having silently dropped it. Whoever is reading the
             # log is usually not the player who got the message.
             print(f"#{caller.channel} merge FAILED: {head}", file=sys.stderr)
+            if REFUSAL_MARKER not in (stderr or ""):
+                # Not a refusal, so the channel got a fixed sentence and the
+                # actual cause -- a traceback, or the log up to a kill -- is
+                # only here.
+                print(tail(stderr) or tail(stdout) or "(no output)",
+                      file=sys.stderr)
             await caller.send(
                       reply=False,
                       content=f"**Error:** {head} {SAD_EMOJI}"
@@ -2158,6 +2281,29 @@ async def do_merge(caller, map_size, overlays, base=None, allow_history=True):
                     await m.add_reaction(DONE_EMOJI)
                 except discord.HTTPException:
                     pass
+    except Exception:
+        # Anything unforeseen after the ack -- a Discord error other than the
+        # Forbidden Caller.send handles, an upload Discord refuses. Left to the
+        # command error handlers, the ack kept saying "Merging..." and /merge
+        # heard nothing at all, its placeholder already gone. So the ack
+        # itself is turned into the failure, and the trace goes to the console.
+        print(f"#{caller.channel} merge FAILED with an unexpected error:",
+              file=sys.stderr)
+        traceback.print_exc()
+        text = (f"Something went wrong with this merge. {SAD_EMOJI} Try "
+                f"again, or ask whoever runs the bot to check its console.")
+        told = False
+        if rec.notice is not None:
+            try:
+                await rec.notice.edit(content=text)
+                told = True
+            except discord.HTTPException:
+                pass
+        if not told:
+            try:
+                await caller.send(reply=False, content=text)
+            except discord.HTTPException:
+                pass
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

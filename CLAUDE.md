@@ -1265,6 +1265,16 @@ copied **nothing at all**, and the fix read as complete while shipping an empty
 image. `tests/` and `shoreline/` are already excluded wholesale, so the `*.png`
 rule was redundant as well as harmful; it is gone and should not come back.
 
+**`STOPSIGNAL SIGINT` is what makes a restart take half a second instead of
+ten.** The bot is PID 1 in the container, and Linux ignores SIGTERM — Docker's
+default stop signal — for a PID 1 with no handler for it, which Python does not
+install. So every stop, restart and redeploy waited out Docker's 10 s grace and
+then SIGKILLed the bot mid-gateway (measured: 10.7 s). Python does handle SIGINT,
+as KeyboardInterrupt, and `bot.run` closes cleanly on it (measured: 0.5 s). A
+merge in flight is cancelled by that shutdown, so `run_polymerge` kills its child
+on `CancelledError` rather than leaving it running while the merge's `finally`
+deletes its working directory.
+
 It calls `polymerge.py` as a **subprocess**, not an import. polymerge is a
 CLI: it reads `sys.argv` and reports every failure via `SystemExit`.
 Importing it would mean catching `SystemExit` throughout and sharing a
@@ -1273,6 +1283,50 @@ the bot's event loop. The subprocess gets isolation, a timeout that actually
 works, and stdout/stderr for free — and polymerge's failure text (e.g. the
 wrong-`--map-size` message) is passed straight through to the channel rather
 than replaced with a generic error.
+
+**But only a refusal is passed through — never a traceback, never stdout**
+(`merge_failure`, `REFUSAL_MARKER`). The headline used to be the first line of
+`tail(stderr) or tail(stdout)`, and three ordinary failures broke that:
+- **Killed** — the OOM killer, under compose's 2 GB cap — returns rc -9 with
+  empty stderr, so the channel got the tail of *stdout*: the per-shot diagnostic
+  log and the timing block, headed "**Error:** ...".
+- **Crashed** — an uncaught exception put "Traceback (most recent call last):"
+  in the headline and OpenCV internals in a code block.
+- **Library noise** — libjpeg's "Premature end of JPEG file" and the like reach
+  stderr *before* the refusal, so the noise became the headline and the real
+  refusal was buried under it.
+
+polymerge now prints `POLYMERGE-REFUSAL:` on stderr immediately before any
+string `SystemExit`, and polybot passes on only what follows the last marker.
+With no marker the channel gets a fixed sentence chosen by return code (timed
+out, killed — "most likely for running out of memory" — or "something went
+wrong"), and the console gets the stderr tail, or stdout's when stderr is empty,
+since that is the only place the cause now appears.
+
+**Discord errors other than Forbidden are now answered too.** `Caller.send` only
+ever swallowed Forbidden, so anything else escaped `do_merge` after the ack had
+gone out, and the ack went on saying "Merging…" forever: `!merge` got a bare
+"Command failed: CommandInvokeError", and `/merge` got nothing, because
+`on_tree_error` tried to edit a placeholder `clear_placeholder` had already
+deleted. Three cases, each handled where it arises:
+- **A screenshot deleted while its merge was queued** (its own message, or the
+  marked one): `a.save` raises NotFound inside the slot. Caught around the
+  downloads, and the player is told which image could not be fetched.
+- **A command message deleted before the bot replies** — by the player, or by a
+  moderation bot that clears prefix commands. A plain `ctx.reply` 400s on a
+  missing reference, and `on_command_error`'s own reply then failed the same way.
+  Replies go out with `fail_if_not_exists=False`, which posts without the link.
+- **Anything else after the ack** — an upload refused with a 413, say. A
+  catch-all in `do_merge` turns the ack itself into a failure line and prints the
+  traceback to the console. `on_tree_error` also falls back to an ephemeral
+  followup when its edit target is gone.
+
+**The bot pings nobody but the player it replies to** (`allowed_mentions` on the
+`Bot`). The unrecognized-word reply echoes the player's words in backticks, and a
+backtick inside a word closes the span early: `` !merge x`@everyone `` rendered a
+live @everyone, which pinged for real wherever the bot's role could mention
+everyone. `quote_words` also drops backticks and bounds the list, since a
+thousand junk words pushed that reply past 2000 characters and it failed.
 
 **A refusal is also logged to the console** (`merge FAILED:`), and that line was
 missing for a long time. The error path returns before the fog-lock, dropped-shot
@@ -1366,6 +1420,16 @@ CLI; a CLI user has no reason for one.
 Do not "simplify" this by moving the count back into polybot. The only way to do
 it there is to download first, which is what the limit exists to avoid, and the
 refusal would then land *after* the player had queued and waited.
+
+**Pixels are capped as well as bytes** (`MAX_IMAGE_PIXELS`, 40 MP, in both
+files). The byte cap does not bound the decode: a 1.2 MB PNG declaring
+20000x20000 was measured OOM-killing a merge under the container's 2 GB in 6
+seconds. polybot refuses on the dimensions Discord reports on the attachment,
+before queueing or downloading; polymerge sets `OPENCV_IO_MAX_IMAGE_PIXELS`
+before importing cv2 (OpenCV reads it once, at import) and turns the resulting
+`cv2.error` into an ordinary refusal, which covers an attachment Discord gave no
+dimensions for and the CLI. Phone and tablet screenshots run 2-10 MP, so 40 MP is
+a bound on the absurd only; keep the two constants in step.
 
 **Oversized composites are re-encoded, not refused** (`shrink_for_upload`).
 The composite is a little under the template's own size (2880x1800 at 20x20)
