@@ -1980,6 +1980,15 @@ Facts about these files worth knowing before touching them:
   `2spawns` is a 2x2 grid of 4 zones, `3spawns` a 3x3 of 9. The 9 zones on
   20x20 are the candidate spawns for a 6-player game, so 3 end up empty. Never
   hardcode the digit — `overlay_layer_path` globs it.
+- **`huge-3spawns.png`'s zones are 2x2 tiles, not 4x4** (corrected 2026-10-27
+  from players' feedback on real Huge 3v3 games). The render originally drew
+  each of the nine zones as a 4x4 block of tile diamonds at tiles 2-5, 8-11
+  and 14-17; the real zone is that block's centre 2x2 — tiles 3-4, 9-10 and
+  15-16 in each direction. The file was cut down to those 36 diamonds from the
+  original render's own pixels (each tile is a separate sprite, so whole
+  diamonds were kept and nothing redrawn), so its *style* is still the game's.
+  Treat the *extent* as authored data, like `tiny-push.png`. The other sizes'
+  `2spawns` layers have not been checked against real games the same way.
 - **`shade` and `spawns` are clipped to fog** (`OVERLAY_FOG_ONLY`), confirmed
   with the project owner; `grid` and `push` cover the whole board. The split is
   between layers that *fill* and layers that *reference*. A color wash over
